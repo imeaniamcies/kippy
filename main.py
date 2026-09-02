@@ -317,9 +317,7 @@ class PageCache:
         if not data:
             return
         try:
-            name = self.source.pages[index]
-            ext = (name.suffix if isinstance(name, Path) else Path(name).suffix)
-            ext = ext.lstrip('.').lower() or 'jpg'
+            ext = 'png' if self.source._kind == 'pdf' else self._page_ext(index)
             texture = CoreImage(io.BytesIO(data), ext=ext).texture
         except Exception as e:
             print(f"Failed to decode page {index}: {e}")
@@ -328,6 +326,11 @@ class PageCache:
         self._trim(index)
         if callback:
             callback(index, texture)
+
+    def _page_ext(self, index):
+        name = self.source.pages[index]
+        ext = (name.suffix if isinstance(name, Path) else Path(name).suffix)
+        return ext.lstrip('.').lower() or 'jpg'
 
     def _trim(self, keep_near):
         if len(self.textures) <= self.max_cache:
@@ -346,8 +349,10 @@ def load_cover_async(comic_path, callback):
             src = ComicSource(comic_path)
             if src.page_count():
                 data = src.get_page_bytes(0)
-                name = src.pages[0]
-                ext = (name.suffix if isinstance(name, Path) else Path(name).suffix)
+                ext = 'png' if src._kind == 'pdf' else (
+                    src.pages[0].suffix if isinstance(src.pages[0], Path)
+                    else Path(src.pages[0]).suffix
+                )
                 ext = ext.lstrip('.').lower() or 'jpg'
             src.close()
         except Exception as e:
