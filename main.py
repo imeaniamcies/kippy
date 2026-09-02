@@ -88,6 +88,7 @@ BAR_BG = (0.10, 0.10, 0.13, 1)
 CARD_BG = (0.13, 0.13, 0.17, 1)
 CARD_BG_DARK = (0.045, 0.045, 0.06, 1)
 ACCENT = (0.42, 0.62, 1, 1)
+ERROR_ACCENT = (0.94, 0.38, 0.4, 1)
 TEXT_PRIMARY = (0.96, 0.96, 0.98, 1)
 TEXT_SECONDARY = (0.6, 0.6, 0.66, 1)
 TEXT_MUTED = (0.45, 0.45, 0.52, 1)
@@ -870,17 +871,40 @@ class PageViewer(Widget):
 # Shared popup helpers
 # --------------------------------------------------------------------------- #
 
-def show_message(title, message):
+def _themed_popup(title, content, size_hint, accent):
+    """Popup styled to match the app's dark theme instead of Kivy's
+    default light modal chrome."""
+    popup = Popup(
+        title=title,
+        content=content,
+        size_hint=size_hint,
+        background='',
+        background_color=CARD_BG_DARK,
+        title_color=TEXT_PRIMARY,
+        title_size='16sp',
+        separator_color=accent,
+    )
+    return popup
+
+
+def show_message(title, message, accent=ACCENT):
     content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(14))
     from kivy.uix.label import Label
     lbl = Label(text=message, color=TEXT_PRIMARY, halign='left', valign='top')
     lbl.bind(size=lambda w, s: setattr(w, 'text_size', s))
     content.add_widget(lbl)
-    btn = Button(text='OK', size_hint_y=None, height=dp(44))
+    btn = Button(text='OK', size_hint_y=None, height=dp(44), background_color=accent)
     content.add_widget(btn)
-    popup = Popup(title=title, content=content, size_hint=(0.85, 0.6))
+    popup = _themed_popup(title, content, (0.85, 0.6), accent)
     btn.bind(on_release=lambda *a: popup.dismiss())
     popup.open()
+
+
+def show_error(title, message):
+    """Same as show_message but visually flagged as an error (red accent),
+    for any load/parse/IO failure that would otherwise only print to the
+    console."""
+    show_message(title, message, accent=ERROR_ACCENT)
 
 
 def show_confirm(title, message, on_confirm):
@@ -891,11 +915,11 @@ def show_confirm(title, message, on_confirm):
     content.add_widget(lbl)
     row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
     cancel = Button(text='Cancel')
-    confirm = Button(text='Confirm')
+    confirm = Button(text='Confirm', background_color=ACCENT)
     row.add_widget(cancel)
     row.add_widget(confirm)
     content.add_widget(row)
-    popup = Popup(title=title, content=content, size_hint=(0.85, 0.6))
+    popup = _themed_popup(title, content, (0.85, 0.6), ACCENT)
     cancel.bind(on_release=lambda *a: popup.dismiss())
 
     def do_confirm(*a):
@@ -913,7 +937,7 @@ def folder_picker_popup(title, start_path, on_choose):
     chooser = FileChooserListView(path=start_path, dirselect=True)
     content.add_widget(chooser)
     btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-    popup = Popup(title=title, content=content, size_hint=(0.85, 0.85))
+    popup = _themed_popup(title, content, (0.85, 0.85), ACCENT)
 
     def choose(*a):
         folder = chooser.selection[0] if chooser.selection else chooser.path
@@ -921,7 +945,7 @@ def folder_picker_popup(title, start_path, on_choose):
         on_choose(folder)
 
     btns.add_widget(Button(text='Cancel', on_release=lambda *a: popup.dismiss()))
-    btns.add_widget(Button(text='Select', on_release=choose))
+    btns.add_widget(Button(text='Select', on_release=choose, background_color=ACCENT))
     content.add_widget(btns)
     popup.open()
 
@@ -1228,7 +1252,7 @@ class LibraryTab(BoxLayout):
 
     def show_menu(self, anchor):
         content = BoxLayout(orientation='vertical', spacing=dp(4), padding=dp(6))
-        popup = Popup(title='Library', content=content, size_hint=(0.6, 0.36))
+        popup = _themed_popup('Library', content, (0.6, 0.36), ACCENT)
 
         def action(fn):
             def run(*a):
@@ -1272,6 +1296,7 @@ class LibraryTab(BoxLayout):
                     dirs[:] = []
         except Exception as e:
             print(f"Scan error: {e}")
+            Clock.schedule_once(lambda dt: show_error('Could not scan folder', str(e)))
         found.sort(key=natural_key)
         Clock.schedule_once(lambda dt: self._populate(found))
 
@@ -1351,6 +1376,7 @@ class UpdatesTab(BoxLayout):
                     dirs[:] = []
         except Exception as e:
             print(f"Scan error: {e}")
+            Clock.schedule_once(lambda dt: show_error('Could not scan folder', str(e)))
         found.sort(key=lambda t: t[0], reverse=True)
         paths = [p for _, p in found[:40]]
         Clock.schedule_once(lambda dt: self._populate(paths))
@@ -1887,9 +1913,12 @@ class ReaderScreen(Screen):
         try:
             self.source = ComicSource(path)
         except Exception as e:
-            self.comic_title = f'Could not open comic: {e}'
+            self.comic_title = 'Could not open comic'
             self.source = None
             self.total_pages = 0
+            self.overlay_visible = True
+            self._apply_overlay(instant=True)
+            show_error('Could not open comic', f'{Path(path).name}\n\n{e}')
             return
         self.cache = PageCache(self.source)
         self.total_pages = self.source.page_count()
@@ -1897,9 +1926,9 @@ class ReaderScreen(Screen):
         page, _total = App.get_running_app().store.get_progress(path)
         start = page if 0 <= page < self.total_pages else 0
         self.show_page(start)
-        self.overlay_visible = True
+        self.overlay_visible = False
         self._apply_overlay(instant=True)
-        self._schedule_autohide()
+        self._cancel_autohide()
 
     def show_page(self, index):
         if self.source is None or self.total_pages == 0:
