@@ -2,7 +2,8 @@
 Comic Reader - a Kivy-based comic book reader.
 
 Supports .cbz/.zip, .cbr/.rar (requires the `rarfile` package + a system
-`unrar`/`unar` binary) and plain folders of images.
+`unrar`/`unar` binary), .pdf (requires the `PyMuPDF` package, `pip install
+pymupdf`) and plain folders of images.
 
 Features
 --------
@@ -67,9 +68,16 @@ try:
 except ImportError:
     RAR_SUPPORT = False
 
+try:
+    import fitz  # PyMuPDF
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
-COMIC_EXTS = {'.cbz', '.zip', '.cbr', '.rar'}
+COMIC_EXTS = {'.cbz', '.zip', '.cbr', '.rar', '.pdf'}
+PDF_RENDER_ZOOM = 2.0  # ~144 DPI; raise for sharper (but heavier) pages
 
 DATA_DIR = Path.home() / '.comic_reader'
 DATA_FILE = DATA_DIR / 'data.json'
@@ -237,6 +245,13 @@ class ComicSource:
                      if Path(n).suffix.lower() in IMG_EXTS]
             names.sort(key=natural_key)
             self.pages = names
+        elif p.suffix.lower() == '.pdf':
+            if not PDF_SUPPORT:
+                raise ValueError("PDF support requires the 'PyMuPDF' package "
+                                  "(pip install pymupdf).")
+            self._kind = 'pdf'
+            self._archive = fitz.open(p)
+            self.pages = list(range(self._archive.page_count))
         else:
             raise ValueError(f"Unsupported comic format: {p.suffix}")
 
@@ -250,6 +265,11 @@ class ComicSource:
         try:
             if self._kind == 'dir':
                 return item.read_bytes()
+            elif self._kind == 'pdf':
+                page = self._archive.load_page(item)
+                mat = fitz.Matrix(PDF_RENDER_ZOOM, PDF_RENDER_ZOOM)
+                pix = page.get_pixmap(matrix=mat)
+                return pix.tobytes('png')
             else:
                 return self._archive.read(item)
         except Exception as e:
@@ -1220,7 +1240,7 @@ class LibraryTab(BoxLayout):
             ('Open Folder\u2026', self.choose_folder),
             ('Refresh', self.rescan),
             ('About', lambda: show_message(
-                'About', 'Comic Reader\n\nA local .cbz / .cbr / folder comic reader.')),
+                'About', 'Comic Reader\n\nA local .cbz / .cbr / .pdf / folder comic reader.')),
         ]:
             b = Button(text=label, size_hint_y=None, height=dp(44))
             b.bind(on_release=action(fn))
@@ -1678,7 +1698,7 @@ class MoreTab(BoxLayout):
 
     def show_about(self):
         show_message('About', 'Comic Reader\nVersion 1.0\n\n'
-                     'A local .cbz / .cbr / folder comic reader built with Kivy.')
+                     'A local .cbz / .cbr / .pdf / folder comic reader built with Kivy.')
 
     def show_help(self):
         show_message('Help',
