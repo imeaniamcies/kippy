@@ -54,6 +54,8 @@ from kivy.properties import (
     BooleanProperty, NumericProperty, ObjectProperty, StringProperty, ListProperty
 )
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition, NoTransition
+from kivy.factory import Factory
+Factory.register('NoTransition', module='kivy.uix.screenmanager')
 from kivy.uix.widget import Widget
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
