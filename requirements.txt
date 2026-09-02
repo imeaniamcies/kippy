@@ -1,0 +1,7 @@
+# Wajib - dipakai untuk seluruh UI/reader.
+kivy>=2.2.0
+
+# Opsional - hanya diperlukan kalau mau baca file .cbr / .rar.
+# Selain paket ini, sistem juga butuh binary `unrar` atau `unar` terpasang
+# (mis. `sudo apt install unrar` di Linux, atau `brew install unar` di macOS).
+rarfile>=4.1
