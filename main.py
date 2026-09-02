@@ -54,8 +54,6 @@ from kivy.properties import (
     BooleanProperty, NumericProperty, ObjectProperty, StringProperty, ListProperty
 )
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition, NoTransition
-from kivy.factory import Factory
-Factory.register('NoTransition', module='kivy.uix.screenmanager')
 from kivy.uix.widget import Widget
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -1793,6 +1791,7 @@ Builder.load_string('''
 class MainScreen(Screen):
 
     def on_kv_post(self, base_widget):
+        self.ids.tabs.transition = NoTransition()
         self.ids.bottom_nav.on_tab = self._switch_tab
 
     def _switch_tab(self, key):
@@ -1820,7 +1819,6 @@ Builder.load_string('''
         orientation: 'vertical'
         ScreenManager:
             id: tabs
-            transition: NoTransition()
             Screen:
                 name: 'tab_library'
                 LibraryTab
