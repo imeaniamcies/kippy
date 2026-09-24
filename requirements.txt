@@ -1,6 +1,5 @@
 Flask>=3.0
 Werkzeug>=3.0
-gunicorn>=21.0
 supabase>=2.10
 httpx
 python-dotenv

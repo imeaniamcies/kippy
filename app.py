@@ -1,851 +1,1450 @@
 """
-Novel Bridge - backend server (Supabase edition, optimized)
-=============================================================
+Novel Bridge - Kivy/KivyMD client
+===================================
 
-Same API as before, but the database and file storage are now a free
-Supabase project instead of local SQLite + a local uploads/ folder. That
-means the Flask server itself is fully stateless - handy since Hostinger
-(or most cheap hosts) don't guarantee a persistent disk across redeploys.
+The bridge between writer and reader. Talks to the Flask backend in
+../server/app.py over plain HTTP/JSON.
 
-PERFORMANCE / STABILITY CHANGES vs the original version
----------------------------------------------------------
-1. Session/user lookups (used on nearly every request) are cached
-   in-memory for a few seconds, instead of hitting Supabase with 2
-   sequential queries on every single API call.
-2. HTTP keep-alive/connection pooling to Supabase is restored (it was
-   fully disabled before), except on Windows dev machines where that
-   caused a flaky-socket bug - see _build_http_client().
-3. Chapter/novel view counters are no longer written synchronously on
-   every read. They're buffered in memory and flushed in a batch every
-   ~15s via a single atomic DB call (see bump_chapter_views in
-   optimizations.sql). This removes a read-then-write race condition
-   and turns "N reads = N writes" into "N reads = ~1 write per 15s".
-4. writer_stats() no longer does one chapters query per novel (N+1) -
-   it does exactly 2 queries total regardless of how many novels a
-   writer has.
-5. /api/novels supports pagination (page/per_page) and the most common
-   query (public, first page, no search) is cached for a few seconds,
-   since it's hit on every single Home tab open by every user.
-6. Old sessions are now cleaned up automatically on a background timer
-   so the `sessions` table doesn't grow forever.
-7. Basic rate limiting on login/register (and a light global default)
-   to blunt spam/abuse. This is optional - if flask-limiter isn't
-   installed, the server runs fine without it.
+Roles
+-----
+  owner / admin  -> see an Admin tab: approve or reject submitted novels
+                    and chapters.
+  writer         -> see a Write tab: submit new novels (title, description,
+                    thumbnail, tags, status), attach .txt/.md chapter files,
+                    see per-novel stats, flip ongoing/completed.
+  user / guest   -> browse & read anything approved from the Home tab.
+                    Browsing does not require an account; reading fully
+                    works while logged out.
 
-Run `optimizations.sql` in the Supabase SQL editor once (see that file)
-to get the full benefit of #3 and #6. The server also works without it
-(it detects missing columns/functions and falls back to the old,
-slower-but-correct behavior), so you can deploy this file first and run
-the SQL whenever convenient.
-
-One-time setup
----------------
-1. Create a free project at https://supabase.com.
-2. Project -> SQL Editor -> paste & run schema.sql (creates the tables and
-   a public "thumbnails" storage bucket), then also run optimizations.sql.
-3. Project -> Settings -> API. Copy:
-     - "Project URL"            -> SUPABASE_URL
-     - "service_role" secret key -> SUPABASE_SERVICE_KEY
-   NEVER put the service_role key in the Kivy client or anywhere public -
-   it bypasses Row Level Security. It only ever lives on this server.
-4. Set both as environment variables before running:
-     export SUPABASE_URL=https://xxxx.supabase.co
-     export SUPABASE_SERVICE_KEY=eyJ...
-5. pip install -r requirements.txt
-   (optionally also: pip install flask-limiter  -> enables rate limiting)
-6. python app.py
-   This prints a default owner login (owner / change-me-now) the first
-   time it finds no owner account - log in and change it immediately via
-   POST /api/me/password.
-
-Deploying on Hostinger (or any host)
--------------------------------------
-Because state now lives in Supabase, deploying is just: upload server/,
-set the two env vars above in your host's environment/panel, install
-requirements, and run behind gunicorn with a few workers/threads so
-requests don't queue behind each other:
-    gunicorn -w 4 --threads 2 --timeout 60 -b 127.0.0.1:8000 app:app
-No persistent disk needed - redeploys/restarts are safe.
+Setup
+-----
+    pip install -r requirements.txt
+    # edit SERVER_URL below (or set NOVEL_BRIDGE_SERVER env var) to point
+    # at your running server, e.g. https://yourdomain.com or
+    # http://127.0.0.1:8000 for local testing.
+    python main.py
 """
 
 import os
 import re
-import time
-import secrets
-import platform
-import datetime
 import threading
-from collections import defaultdict
 from pathlib import Path
-from functools import wraps
 
-import httpx
-from flask import Flask, request, jsonify, g
-from werkzeug.security import generate_password_hash, check_password_hash
-from supabase import create_client, Client, ClientOptions
+import requests
 
-from dotenv import load_dotenv
-load_dotenv()
-
-try:
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
-    _HAS_LIMITER = True
-except ImportError:
-    _HAS_LIMITER = False
-
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError(
-        'Set SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables '
-        '(see the setup steps at the top of this file).'
-    )
-
-
-def _build_http_client():
-    """httpx's HTTP/2 transport (used by default by the supabase client)
-    has a known flaky-socket bug on Windows dev machines - it intermittently
-    raises `httpx.ReadError: [WinError 10035] A non-blocking socket operation
-    could not be completed immediately` when a pooled keep-alive connection
-    is reused. Forcing HTTP/1.1 avoids it everywhere.
-
-    The *original* fix for this also disabled connection keep-alive
-    entirely (max_keepalive_connections=0), which "fixed" the Windows bug
-    but meant every single request to Supabase - on every deployed server,
-    Windows or not - opened a brand new TCP+TLS connection from scratch.
-    Under real traffic that's a lot of unnecessary handshake overhead and
-    a good way to make the server feel like it's melting under load.
-
-    Here we only disable keep-alive on Windows (where the bug actually
-    happens) and use a real connection pool everywhere else.
-    """
-    is_windows = platform.system() == 'Windows'
-    limits = httpx.Limits(
-        max_keepalive_connections=0 if is_windows else 20,
-        max_connections=100,
-        keepalive_expiry=30,
-    )
-    return httpx.Client(http2=False, limits=limits)
-
-
-_http_client = _build_http_client()
-sb: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_SERVICE_KEY,
-    options=ClientOptions(httpx_client=_http_client),
+from kivy.app import App
+from kivy.factory import Factory
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.lang import Builder
+from kivy.metrics import dp
+from kivy.utils import platform
+from kivy.graphics import Color, RoundedRectangle
+from kivy.properties import (
+    BooleanProperty, ListProperty, NumericProperty, ObjectProperty, StringProperty
 )
+from kivy.uix.image import AsyncImage
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.filechooser import FileChooserListView
+from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
 
-ALLOWED_THUMB_EXT = {'.png', '.jpg', '.jpeg', '.webp'}
-ALLOWED_CHAPTER_EXT = {'.txt', '.md'}
-ROLES = ('owner', 'admin', 'writer', 'user')
-THUMB_BUCKET = 'thumbnails'
-SESSION_LIFETIME_DAYS = 30
+from kivymd.app import MDApp
+from kivymd.uix.screen import MDScreen
+from kivymd.uix.card import MDCard
+from kivymd.uix.button import MDRaisedButton, MDFlatButton, MDIconButton
+from kivymd.uix.textfield import MDTextField
+from kivymd.uix.label import MDLabel
+from kivymd.uix.list import MDList, OneLineAvatarIconListItem, IconLeftWidget, IconRightWidget
+from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.scrollview import MDScrollView
+from kivymd.uix.gridlayout import MDGridLayout
+from kivymd.uix.dialog import MDDialog
+from kivymd.uix.menu import MDDropdownMenu
 
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB per request
+# Load API_URL from a bundled .env (python-dotenv is optional; falls back to
+# environment variables / the localhost default if it isn't installed).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+except ImportError:
+    pass
 
-# --------------------------------------------------------------------------- #
-# Optional rate limiting - protects login/register (and everything else, at
-# a looser default) from being hammered. Works fine without flask-limiter
-# installed; it just means requests aren't rate-limited.
-# --------------------------------------------------------------------------- #
+SERVER_URL = (
+    os.environ.get('API_URL')
+    or os.environ.get('NOVEL_BRIDGE_SERVER')
+    or 'http://127.0.0.1:8000'
+).rstrip('/')
 
-if _HAS_LIMITER:
-    limiter = Limiter(get_remote_address, app=app, default_limits=['200 per minute'])
-else:
-    limiter = None
-    print('[startup] flask-limiter not installed - running without rate limiting. '
-          'pip install flask-limiter to enable it.')
-
-
-def rate_limit(spec):
-    def deco(fn):
-        return limiter.limit(spec)(fn) if limiter else fn
-    return deco
-
-
-def now_iso():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-
-def init_owner():
-    """Create the default owner account the very first time this runs."""
-    existing = sb.table('users').select('id').eq('role', 'owner').limit(1).execute()
-    if not existing.data:
-        sb.table('users').insert({
-            'username': 'owner',
-            'password_hash': generate_password_hash('change-me-now'),
-            'role': 'owner',
-        }).execute()
-        print("Created default owner account -> username: owner / password: change-me-now")
-        print("Please log in and change this password immediately.")
+BG = (0.06, 0.06, 0.08, 1)
+CARD_BG = (0.13, 0.13, 0.17, 1)
+ACCENT = (0.42, 0.62, 1, 1)
 
 
 # --------------------------------------------------------------------------- #
-# Session/user cache
-# --------------------------------------------------------------------------- #
-# current_user() is called on nearly every request. Without this cache it
-# means 2 sequential Supabase queries (sessions, then users) per request,
-# for every request, all day. A short-lived cache turns that into roughly
-# 2 queries per active user every SESSION_CACHE_TTL seconds instead.
-#
-# Trade-off: a role change (set_role) or account edit can take up to
-# SESSION_CACHE_TTL seconds to be reflected for a currently-logged-in user.
-# That's an acceptable trade for a reader/writer app; lower the TTL if you
-# need tighter guarantees.
-
-SESSION_CACHE_TTL = 20  # seconds
-_session_cache = {}
-_session_cache_lock = threading.Lock()
-
-
-def _cache_get_user(token):
-    with _session_cache_lock:
-        entry = _session_cache.get(token)
-        if not entry:
-            return None
-        user, expires_at = entry
-        if expires_at < time.monotonic():
-            del _session_cache[token]
-            return None
-        return user
-
-
-def _cache_put_user(token, user):
-    with _session_cache_lock:
-        _session_cache[token] = (user, time.monotonic() + SESSION_CACHE_TTL)
-
-
-def _cache_drop_token(token):
-    with _session_cache_lock:
-        _session_cache.pop(token, None)
-
-
-# --------------------------------------------------------------------------- #
-# Auth helpers
+# API client - every call runs on a worker thread, result delivered on the
+# main thread via Clock so the UI never blocks.
 # --------------------------------------------------------------------------- #
 
-def current_user():
-    token = request.headers.get('Authorization', '')
-    if token.startswith('Bearer '):
-        token = token[7:]
-    if not token:
-        return None
-
-    cached = _cache_get_user(token)
-    if cached is not None:
-        return cached
-
-    session = sb.table('sessions').select('user_id').eq('token', token).limit(1).execute()
-    if not session.data:
-        return None
-    user = sb.table('users').select('*').eq('id', session.data[0]['user_id']).limit(1).execute()
-    if not user.data:
-        return None
-
-    result = user.data[0]
-    _cache_put_user(token, result)
-    return result
+class ApiError(Exception):
+    def __init__(self, message, status=0):
+        super().__init__(message)
+        self.status = status
 
 
-def require_role(*roles):
-    def deco(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            user = current_user()
-            if user is None:
-                return jsonify(error='authentication required'), 401
-            if roles and user['role'] not in roles:
-                return jsonify(error='insufficient privileges'), 403
-            g.user = user
-            return fn(*args, **kwargs)
-        return wrapper
-    return deco
+class Api:
+    def __init__(self):
+        self.token = None
 
+    def _headers(self):
+        h = {}
+        if self.token:
+            h['Authorization'] = f'Bearer {self.token}'
+        return h
 
-def optional_auth(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        g.user = current_user()
-        return fn(*args, **kwargs)
-    return wrapper
-
-
-# --------------------------------------------------------------------------- #
-# Background jobs: expired-session cleanup + buffered view-count flushing
-# --------------------------------------------------------------------------- #
-# Both are daemon threads started once at import time, so they run whether
-# the app is launched directly (python app.py) or imported by gunicorn.
-
-def _cleanup_expired_sessions_loop():
-    while True:
-        time.sleep(3600)  # hourly is plenty
+    def _request(self, method, path, **kwargs):
+        url = f'{SERVER_URL}{path}'
         try:
-            sb.table('sessions').delete().lt('expires_at', now_iso()).execute()
-        except Exception as e:
-            # optimizations.sql not run yet (no expires_at column) - skip quietly.
-            print(f'[session cleanup] skipped ({e})')
+            resp = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
+        except requests.exceptions.RequestException as e:
+            raise ApiError(f'Could not reach server: {e}')
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if resp.status_code >= 400:
+            raise ApiError(body.get('error', f'server error ({resp.status_code})'), resp.status_code)
+        return body
 
-
-_view_buffer = defaultdict(int)
-_view_buffer_lock = threading.Lock()
-VIEW_FLUSH_INTERVAL = 15  # seconds
-
-
-def _queue_chapter_view(chapter_id):
-    """Record a view in memory instead of writing to the DB immediately."""
-    with _view_buffer_lock:
-        _view_buffer[chapter_id] += 1
-
-
-def _flush_views_loop():
-    while True:
-        time.sleep(VIEW_FLUSH_INTERVAL)
-        with _view_buffer_lock:
-            pending = dict(_view_buffer)
-            _view_buffer.clear()
-        for chapter_id, amount in pending.items():
+    # -- async wrapper -----------------------------------------------------
+    def call(self, method, path, on_success=None, on_error=None, **kwargs):
+        def worker():
             try:
-                # Atomic, single round trip - see bump_chapter_views() in
-                # optimizations.sql. Bumps both the chapter's and its
-                # parent novel's view count in one DB call.
-                sb.rpc('bump_chapter_views', {
-                    'p_chapter_id': chapter_id, 'p_amount': amount,
-                }).execute()
-            except Exception:
-                # optimizations.sql not run yet - fall back to the old
-                # (less atomic, but still correct-enough) read-then-write.
-                try:
-                    chapter = sb.table('chapters').select('views, novel_id') \
-                        .eq('id', chapter_id).limit(1).execute()
-                    if not chapter.data:
-                        continue
-                    row = chapter.data[0]
-                    sb.table('chapters').update(
-                        {'views': row['views'] + amount}
-                    ).eq('id', chapter_id).execute()
-                    novel = sb.table('novels').select('views') \
-                        .eq('id', row['novel_id']).limit(1).execute()
-                    if novel.data:
-                        sb.table('novels').update(
-                            {'views': novel.data[0]['views'] + amount}
-                        ).eq('id', row['novel_id']).execute()
-                except Exception as e2:
-                    print(f'[view flush] failed for chapter {chapter_id}: {e2}')
+                result = self._request(method, path, **kwargs)
+            except ApiError as e:
+                message = str(e)  # capture now - `e` itself is gone once except: ends
+                if on_error:
+                    Clock.schedule_once(lambda dt: on_error(message))
+                return
+            if on_success:
+                Clock.schedule_once(lambda dt: on_success(result))
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -- convenience endpoints ----------------------------------------------
+    def login(self, username, password, on_success, on_error):
+        self.call('POST', '/api/login', on_success, on_error,
+                   json={'username': username, 'password': password})
+
+    def register(self, username, password, on_success, on_error):
+        self.call('POST', '/api/register', on_success, on_error,
+                   json={'username': username, 'password': password})
+
+    def me(self, on_success, on_error):
+        self.call('GET', '/api/me', on_success, on_error)
+
+    def list_novels(self, on_success, on_error, mine=False, pending=False, q=''):
+        params = {}
+        if mine:
+            params['mine'] = '1'
+        if pending:
+            params['pending'] = '1'
+        if q:
+            params['q'] = q
+        self.call('GET', '/api/novels', on_success, on_error, params=params)
+
+    def get_novel(self, novel_id, on_success, on_error):
+        self.call('GET', f'/api/novels/{novel_id}', on_success, on_error)
+
+    def create_novel(self, fields, thumbnail_path, on_success, on_error):
+        files = {}
+        if thumbnail_path:
+            files['thumbnail'] = (Path(thumbnail_path).name, open(thumbnail_path, 'rb'))
+        self.call('POST', '/api/novels', on_success, on_error, data=fields, files=files or None)
+
+    def update_novel(self, novel_id, fields, on_success, on_error):
+        self.call('PUT', f'/api/novels/{novel_id}', on_success, on_error, json=fields)
+
+    def upload_chapter(self, novel_id, chapter_number, title, file_path, on_success, on_error):
+        files = {'file': (Path(file_path).name, open(file_path, 'rb'))}
+        data = {'chapter_number': str(chapter_number), 'title': title}
+        self.call('POST', f'/api/novels/{novel_id}/chapters', on_success, on_error, data=data, files=files)
+
+    def get_chapter(self, chapter_id, on_success, on_error):
+        self.call('GET', f'/api/chapters/{chapter_id}', on_success, on_error)
+
+    def pending_queue(self, on_success, on_error):
+        self.call('GET', '/api/admin/pending', on_success, on_error)
+
+    def approve_novel(self, novel_id, on_success, on_error):
+        self.call('POST', f'/api/admin/novels/{novel_id}/approve', on_success, on_error)
+
+    def reject_novel(self, novel_id, on_success, on_error):
+        self.call('POST', f'/api/admin/novels/{novel_id}/reject', on_success, on_error)
+
+    def approve_chapter(self, chapter_id, on_success, on_error):
+        self.call('POST', f'/api/admin/chapters/{chapter_id}/approve', on_success, on_error)
+
+    def reject_chapter(self, chapter_id, on_success, on_error):
+        self.call('POST', f'/api/admin/chapters/{chapter_id}/reject', on_success, on_error)
+
+    def writer_stats(self, on_success, on_error):
+        self.call('GET', '/api/writer/stats', on_success, on_error)
+
+    def list_users(self, on_success, on_error):
+        self.call('GET', '/api/users', on_success, on_error)
+
+    def set_role(self, user_id, role, on_success, on_error):
+        self.call('POST', f'/api/users/{user_id}/role', on_success, on_error, json={'role': role})
+
+    def change_password(self, old_password, new_password, on_success, on_error):
+        self.call('POST', '/api/me/password', on_success, on_error,
+                   json={'old_password': old_password, 'new_password': new_password})
+
+    def thumb_url(self, url):
+        """Novel thumbnails are now full Supabase Storage URLs; keep this
+        as a thin pass-through (with a fallback for older relative paths)."""
+        if not url:
+            return ''
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+        return f'{SERVER_URL}{url}'
 
 
-threading.Thread(target=_cleanup_expired_sessions_loop, daemon=True).start()
-threading.Thread(target=_flush_views_loop, daemon=True).start()
+api = Api()
 
 
-# --------------------------------------------------------------------------- #
-# Public novel-list cache
-# --------------------------------------------------------------------------- #
-# The single most-hit query in this whole app: every user, every time they
-# open the Home tab, with no filters. Cache it briefly instead of asking
-# Supabase to re-run the same query over and over within a few seconds of
-# itself.
-
-NOVELS_CACHE_TTL = 20  # seconds
-DEFAULT_PAGE_SIZE = 24
-MAX_PAGE_SIZE = 50
-_novels_cache_lock = threading.Lock()
-_novels_cache = {'data': None, 'expires_at': 0.0}
+_active_toasts = []
 
 
-def _invalidate_novels_cache():
-    with _novels_cache_lock:
-        _novels_cache['data'] = None
-        _novels_cache['expires_at'] = 0.0
-
-
-# --------------------------------------------------------------------------- #
-# Serialization
-# --------------------------------------------------------------------------- #
-
-def novel_public(row):
-    return {
-        'id': row['id'],
-        'title': row['title'],
-        'description': row['description'],
-        'thumbnail_url': row.get('thumbnail_url') or '',
-        'tags': [t for t in (row['tags'] or '').split(',') if t],
-        'status': row['status'],
-        'approved': bool(row['approved']),
-        'rejected': bool(row['rejected']),
-        'views': row['views'],
-        'writer_id': row['writer_id'],
-        'created_at': row['created_at'],
-    }
-
-
-def chapter_public(row, include_content=False):
-    d = {
-        'id': row['id'],
-        'novel_id': row['novel_id'],
-        'chapter_number': row['chapter_number'],
-        'title': row['title'],
-        'approved': bool(row['approved']),
-        'rejected': bool(row['rejected']),
-        'views': row['views'],
-        'created_at': row['created_at'],
-    }
-    if include_content:
-        d['content'] = row.get('content', '')
-    return d
-
-
-def can_see_unapproved(user, novel_row):
-    if user is None:
-        return False
-    if user['role'] in ('owner', 'admin'):
-        return True
-    if user['role'] == 'writer' and user['id'] == novel_row['writer_id']:
-        return True
-    return False
-
-
-# --------------------------------------------------------------------------- #
-# Auth endpoints
-# --------------------------------------------------------------------------- #
-
-@app.post('/api/register')
-@rate_limit('10 per minute')
-def register():
-    data = request.get_json(force=True, silent=True) or {}
-    username = (data.get('username') or '').strip()
-    password = data.get('password') or ''
-    if not username or not password:
-        return jsonify(error='username and password required'), 400
-    if not re.match(r'^[A-Za-z0-9_.-]{3,32}$', username):
-        return jsonify(error='username must be 3-32 chars: letters, numbers, _ . -'), 400
-    if len(password) < 6:
-        return jsonify(error='password must be at least 6 characters'), 400
-
-    existing = sb.table('users').select('id').eq('username', username).limit(1).execute()
-    if existing.data:
-        return jsonify(error='username already taken'), 409
-
-    sb.table('users').insert({
-        'username': username,
-        'password_hash': generate_password_hash(password),
-        'role': 'user',
-    }).execute()
-    return jsonify(message='registered, please log in'), 201
-
-
-@app.post('/api/login')
-@rate_limit('15 per minute')
-def login():
-    data = request.get_json(force=True, silent=True) or {}
-    username = (data.get('username') or '').strip()
-    password = data.get('password') or ''
-    result = sb.table('users').select('*').eq('username', username).limit(1).execute()
-    user = result.data[0] if result.data else None
-    if user is None or not check_password_hash(user['password_hash'], password):
-        return jsonify(error='invalid username or password'), 401
-    token = secrets.token_hex(32)
-    expires_at = (
-        datetime.datetime.now(datetime.timezone.utc)
-        + datetime.timedelta(days=SESSION_LIFETIME_DAYS)
-    ).isoformat()
-    try:
-        sb.table('sessions').insert({
-            'token': token, 'user_id': user['id'], 'expires_at': expires_at,
-        }).execute()
-    except Exception:
-        # optimizations.sql not run yet - sessions table has no expires_at
-        # column. Fall back so login still works; run the SQL when you can
-        # so old sessions get cleaned up automatically.
-        sb.table('sessions').insert({'token': token, 'user_id': user['id']}).execute()
-    return jsonify(token=token, user={'id': user['id'], 'username': user['username'], 'role': user['role']})
-
-
-@app.post('/api/logout')
-@require_role()
-def logout():
-    token = request.headers.get('Authorization', '').replace('Bearer ', '')
-    sb.table('sessions').delete().eq('token', token).execute()
-    _cache_drop_token(token)
-    return jsonify(message='logged out')
-
-
-@app.get('/api/me')
-@require_role()
-def me():
-    u = g.user
-    return jsonify(id=u['id'], username=u['username'], role=u['role'])
-
-
-@app.post('/api/me/password')
-@require_role()
-def change_password():
-    data = request.get_json(force=True, silent=True) or {}
-    old = data.get('old_password') or ''
-    new = data.get('new_password') or ''
-    if not check_password_hash(g.user['password_hash'], old):
-        return jsonify(error='old password incorrect'), 400
-    if len(new) < 6:
-        return jsonify(error='new password must be at least 6 characters'), 400
-    sb.table('users').update({'password_hash': generate_password_hash(new)}).eq('id', g.user['id']).execute()
-    return jsonify(message='password changed')
-
-
-@app.post('/api/users/<int:user_id>/role')
-@require_role('owner')
-def set_role(user_id):
-    data = request.get_json(force=True, silent=True) or {}
-    role = data.get('role')
-    if role not in ROLES:
-        return jsonify(error=f'role must be one of {ROLES}'), 400
-    if role == 'owner':
-        return jsonify(error='cannot grant owner role'), 400
-    sb.table('users').update({'role': role}).eq('id', user_id).execute()
-    return jsonify(message='role updated')
-
-
-@app.get('/api/users')
-@require_role('owner', 'admin')
-def list_users():
-    result = sb.table('users').select('id, username, role, created_at').order('id').execute()
-    return jsonify(result.data)
-
-
-# --------------------------------------------------------------------------- #
-# Novels
-# --------------------------------------------------------------------------- #
-
-@app.get('/api/novels')
-@optional_auth
-def list_novels():
-    mine = request.args.get('mine') == '1'
-    pending = request.args.get('pending') == '1'
-    search = (request.args.get('q') or '').strip()
-
-    try:
-        page = max(1, int(request.args.get('page', 1)))
-    except ValueError:
-        page = 1
-    try:
-        per_page = min(MAX_PAGE_SIZE, max(1, int(request.args.get('per_page', DEFAULT_PAGE_SIZE))))
-    except ValueError:
-        per_page = DEFAULT_PAGE_SIZE
-    offset = (page - 1) * per_page
-
-    # Only the plain "public, first page, default size" query is cache-eligible -
-    # that's the one every user hits just by opening the app.
-    cacheable = not mine and not pending and not search and page == 1 and per_page == DEFAULT_PAGE_SIZE
-    if cacheable:
-        with _novels_cache_lock:
-            if _novels_cache['data'] is not None and _novels_cache['expires_at'] > time.monotonic():
-                return jsonify(_novels_cache['data'])
-
-    if mine:
-        if g.user is None or g.user['role'] not in ('writer', 'admin', 'owner'):
-            return jsonify(error='authentication required'), 401
-        result = sb.table('novels').select('*').eq('writer_id', g.user['id']) \
-            .order('created_at', desc=True).range(offset, offset + per_page - 1).execute()
-    elif pending:
-        if g.user is None or g.user['role'] not in ('admin', 'owner'):
-            return jsonify(error='insufficient privileges'), 403
-        result = sb.table('novels').select('*').eq('approved', False).eq('rejected', False) \
-            .order('created_at').range(offset, offset + per_page - 1).execute()
-    else:
-        q = sb.table('novels').select('*').eq('approved', True)
-        if search:
-            q = q.ilike('title', f'%{search}%')
-        result = q.order('created_at', desc=True).range(offset, offset + per_page - 1).execute()
-
-    data = [novel_public(r) for r in result.data]
-
-    if cacheable:
-        with _novels_cache_lock:
-            _novels_cache['data'] = data
-            _novels_cache['expires_at'] = time.monotonic() + NOVELS_CACHE_TTL
-
-    return jsonify(data)
-
-
-@app.get('/api/novels/<int:novel_id>')
-@optional_auth
-def get_novel(novel_id):
-    result = sb.table('novels').select('*').eq('id', novel_id).limit(1).execute()
-    if not result.data:
-        return jsonify(error='not found'), 404
-    row = result.data[0]
-    if not row['approved'] and not can_see_unapproved(g.user, row):
-        return jsonify(error='not found'), 404
-
-    chapters_q = sb.table('chapters').select('*').eq('novel_id', novel_id)
-    if not can_see_unapproved(g.user, row):
-        chapters_q = chapters_q.eq('approved', True)
-    chapters = chapters_q.order('chapter_number').execute().data
-
-    data = novel_public(row)
-    data['chapters'] = [chapter_public(c) for c in chapters]
-
-    writer = sb.table('users').select('username').eq('id', row['writer_id']).limit(1).execute()
-    data['writer_username'] = writer.data[0]['username'] if writer.data else 'unknown'
-    return jsonify(data)
-
-
-def _upload_thumbnail(file_storage):
-    """Uploads to the Supabase 'thumbnails' bucket, returns a public URL."""
-    ext = Path(file_storage.filename).suffix.lower()
-    if ext not in ALLOWED_THUMB_EXT:
-        raise ValueError(f'thumbnail must be one of {ALLOWED_THUMB_EXT}')
-    name = f'{secrets.token_hex(8)}{ext}'
-    content_type = file_storage.mimetype or 'image/png'
-    sb.storage.from_(THUMB_BUCKET).upload(
-        name, file_storage.read(), {'content-type': content_type}
+def toast(text, duration=2.2):
+    """A small bottom-of-screen message built from plain Kivy widgets only -
+    deliberately avoids KivyMD's Snackbar, whose constructor signature has
+    changed across versions and isn't worth chasing."""
+    label = Label(
+        text=str(text),
+        color=(1, 1, 1, 1),
+        size_hint=(None, None),
+        padding=(dp(16), dp(10)),
     )
-    return sb.storage.from_(THUMB_BUCKET).get_public_url(name)
+    label.texture_update()
+    label.size = (min(label.texture_size[0] + dp(32), Window.width - dp(24)), dp(44))
+    label.text_size = (label.width - dp(32), None)
+    label.halign = 'center'
+    label.valign = 'middle'
+
+    # stack multiple toasts above one another if they overlap in time
+    base_y = dp(24) + sum(t.height + dp(8) for t in _active_toasts)
+    label.pos = ((Window.width - label.width) / 2, base_y)
+
+    with label.canvas.before:
+        Color(0.13, 0.13, 0.17, 0.96)
+        rect = RoundedRectangle(pos=label.pos, size=label.size, radius=[dp(10)])
+
+    def sync_rect(*_a):
+        rect.pos = label.pos
+        rect.size = label.size
+    label.bind(pos=sync_rect, size=sync_rect)
+
+    Window.add_widget(label)
+    _active_toasts.append(label)
+
+    def remove(*_a):
+        if label in _active_toasts:
+            _active_toasts.remove(label)
+        Window.remove_widget(label)
+    Clock.schedule_once(remove, duration)
 
 
-@app.post('/api/novels')
-@require_role('writer', 'admin', 'owner')
-def create_novel():
-    title = (request.form.get('title') or '').strip()
-    description = request.form.get('description') or ''
-    tags = request.form.get('tags') or ''
-    status = request.form.get('status') or 'ongoing'
-    if status not in ('ongoing', 'completed'):
-        status = 'ongoing'
-    if not title:
-        return jsonify(error='title required'), 400
+def file_pick_popup(title, filters, on_choice):
+    """Small filechooser popup; returns the chosen path via on_choice(path)."""
+    layout = MDBoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
+    chooser = FileChooserListView(filters=filters, path=('/storage/emulated/0' if platform == 'android' else str(Path.home())))
+    layout.add_widget(chooser)
+    btn_row = MDBoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+    popup = Popup(title=title, content=layout, size_hint=(0.9, 0.9))
 
-    thumbnail_url = ''
-    file = request.files.get('thumbnail')
-    if file and file.filename:
+    def choose(*_):
+        if chooser.selection:
+            on_choice(chooser.selection[0])
+        popup.dismiss()
+
+    btn_row.add_widget(MDFlatButton(text='Cancel', on_release=lambda *_: popup.dismiss()))
+    btn_row.add_widget(MDRaisedButton(text='Select', on_release=choose))
+    layout.add_widget(btn_row)
+    popup.open()
+
+
+# --------------------------------------------------------------------------- #
+# Reusable widgets
+# --------------------------------------------------------------------------- #
+
+Builder.load_string('''
+<StatusBadge@MDLabel>:
+    adaptive_size: True
+    padding: dp(10), dp(4)
+    bold: True
+    font_size: '11sp'
+    canvas.before:
+        Color:
+            rgba: (0.2, 0.75, 0.4, 1) if self.text == 'ONGOING' else (0.5, 0.5, 0.58, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+
+<TagChip@MDLabel>:
+    adaptive_size: True
+    padding: dp(11), dp(5)
+    font_size: '12sp'
+    color: 0.85, 0.85, 0.92, 1
+    canvas.before:
+        Color:
+            rgba: 0.18, 0.18, 0.24, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(14)]
+        Color:
+            rgba: 0.3, 0.3, 0.4, 1
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(14))
+            width: 1
+
+<NovelCard>:
+    orientation: 'vertical'
+    size_hint: None, None
+    size: dp(120), dp(210)
+    md_bg_color: 0.13, 0.13, 0.17, 1
+    radius: [dp(10)]
+    padding: 0
+    AsyncImage:
+        source: root.thumb_url
+        size_hint_y: None
+        height: dp(160)
+        allow_stretch: True
+        keep_ratio: False
+    MDLabel:
+        text: root.title
+        font_size: '12sp'
+        bold: True
+        shorten: True
+        shorten_from: 'right'
+        halign: 'left'
+        size_hint_y: None
+        height: dp(40)
+        padding: dp(6), 0
+        color: 0.95, 0.95, 0.97, 1
+''')
+
+
+def markdown_to_kivy_markup(text):
+    """Converts a practical subset of Markdown (bold, italic, strikethrough,
+    headings, blockquotes, horizontal rules, bullet/numbered lists, inline
+    code) into Kivy's markup language, so a chapter written in .md renders
+    with real formatting instead of showing raw asterisks/hashes.
+
+    Kivy's Label markup only understands its own [b]/[i]/[color=..] style
+    tags (see kivy.core.text.markup), so this is a small Markdown -> Kivy
+    markup translator, not a full CommonMark implementation - enough for
+    what people actually put in novel chapters."""
+    if not text:
+        return ''
+
+    # Escape Kivy's own markup special characters first, so any literal
+    # [ ] & already in the chapter text can't be misread as a markup tag
+    # once we start inserting real [b]/[i]/... tags below.
+    text = text.replace('&', '&amp;').replace('[', '&bl;').replace(']', '&br;')
+
+    out_lines = []
+    for line in text.split('\n'):
+        stripped = line.strip()
+
+        # Horizontal rule: --- / *** / ___ alone on a line
+        if re.fullmatch(r'(-{3,}|\*{3,}|_{3,})', stripped):
+            out_lines.append('[color=#555566]' + '\u2500' * 30 + '[/color]')
+            continue
+
+        # Headings: # / ## / ###
+        heading_match = re.match(r'^(#{1,3})\s+(.*)', stripped)
+        if heading_match:
+            level = len(heading_match.group(1))
+            size = {1: 24, 2: 20, 3: 17}[level]
+            out_lines.append(f'[size={size}sp][b]{heading_match.group(2)}[/b][/size]')
+            continue
+
+        # Blockquote: > text
+        quote_match = re.match(r'^>\s?(.*)', stripped)
+        if quote_match:
+            out_lines.append(f'[color=#9a9aa8][i]\u2503 {quote_match.group(1)}[/i][/color]')
+            continue
+
+        # Bullet list: - / * / + followed by a space
+        bullet_match = re.match(r'^[-*+]\s+(.*)', stripped)
+        if bullet_match:
+            out_lines.append(f'   \u2022  {bullet_match.group(1)}')
+            continue
+
+        # Numbered list: "1. text"
+        num_match = re.match(r'^(\d+)\.\s+(.*)', stripped)
+        if num_match:
+            out_lines.append(f'   {num_match.group(1)}.  {num_match.group(2)}')
+            continue
+
+        out_lines.append(line)
+
+    text = '\n'.join(out_lines)
+
+    # Inline formatting - order matters: bold+italic together, then bold,
+    # then italic, then strikethrough, then inline code.
+    text = re.sub(r'(\*\*\*|___)(.+?)\1', r'[b][i]\2[/i][/b]', text)
+    text = re.sub(r'(\*\*|__)(.+?)\1', r'[b]\2[/b]', text)
+    text = re.sub(r'(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?!\w)', r'[i]\1[/i]', text)
+    text = re.sub(r'(?<![\w_])_(?!\s)(.+?)(?<!\s)_(?!\w)', r'[i]\1[/i]', text)
+    text = re.sub(r'~~(.+?)~~', r'[s]\1[/s]', text)
+    text = re.sub(r'`([^`]+?)`', r'[color=#8fd6c9]\1[/color]', text)
+
+    return text
+
+
+class NovelCard(MDCard):
+    title = StringProperty('')
+    thumb_url = StringProperty('')
+    novel_id = NumericProperty(0)
+    press_callback = ObjectProperty(None)
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and self.press_callback:
+            self.press_callback(self.novel_id)
+            return True
+        return super().on_touch_down(touch)
+
+
+# --------------------------------------------------------------------------- #
+# Login / Register
+# --------------------------------------------------------------------------- #
+
+class LoginScreen(MDScreen):
+    def do_login(self):
+        username = self.ids.username.text.strip()
+        password = self.ids.password.text
+        if not username or not password:
+            toast('Enter a username and password')
+            return
+        self.ids.status_label.text = 'Signing in...'
+        api.login(username, password, self._login_ok, self._login_fail)
+
+    def _login_ok(self, result):
+        api.token = result['token']
+        app = App.get_running_app()
+        app.user = result['user']
+        self.ids.status_label.text = ''
+        toast(f"Welcome back, {result['user']['username']}")
+        app.on_authenticated()
+
+    def _login_fail(self, msg):
+        self.ids.status_label.text = msg
+
+    def do_register(self):
+        username = self.ids.username.text.strip()
+        password = self.ids.password.text
+        if not username or not password:
+            toast('Enter a username and password')
+            return
+        self.ids.status_label.text = 'Creating account...'
+        api.register(username, password, self._register_ok, self._login_fail)
+
+    def _register_ok(self, result):
+        self.ids.status_label.text = 'Account created - now log in'
+        toast('Registered! Log in below.')
+
+    def continue_as_guest(self):
+        api.token = None
+        App.get_running_app().user = None
+        App.get_running_app().on_authenticated()
+
+
+Builder.load_string('''
+<LoginScreen>:
+    name: 'login'
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: dp(28)
+        spacing: dp(14)
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        Widget:
+            size_hint_y: 0.2
+        MDLabel:
+            text: 'Novel Bridge'
+            font_style: 'H4'
+            bold: True
+            halign: 'center'
+            size_hint_y: None
+            height: dp(50)
+        MDLabel:
+            text: 'Where writers and readers meet'
+            halign: 'center'
+            theme_text_color: 'Secondary'
+            size_hint_y: None
+            height: dp(30)
+        Widget:
+            size_hint_y: 0.1
+        MDTextField:
+            id: username
+            hint_text: 'Username'
+            size_hint_x: 1
+        MDTextField:
+            id: password
+            hint_text: 'Password'
+            password: True
+            size_hint_x: 1
+        MDLabel:
+            id: status_label
+            text: ''
+            theme_text_color: 'Error'
+            halign: 'center'
+            size_hint_y: None
+            height: dp(24)
+        MDRaisedButton:
+            text: 'Log In'
+            size_hint_x: 1
+            on_release: root.do_login()
+        MDFlatButton:
+            text: 'Create Account'
+            size_hint_x: 1
+            on_release: root.do_register()
+        MDFlatButton:
+            text: 'Continue as Guest (read only)'
+            size_hint_x: 1
+            on_release: root.continue_as_guest()
+        Widget:
+            size_hint_y: 0.3
+''')
+
+
+# --------------------------------------------------------------------------- #
+# Home - browse approved novels
+# --------------------------------------------------------------------------- #
+
+class HomeScreen(MDScreen):
+    def on_pre_enter(self, *args):
+        self.refresh()
+
+    def refresh(self):
+        self.ids.grid.clear_widgets()
+        api.list_novels(self._loaded, lambda m: toast(m))
+
+    def _loaded(self, novels):
+        self.ids.grid.clear_widgets()
+        if not novels:
+            self.ids.grid.add_widget(MDLabel(text='No novels published yet.', halign='center'))
+            return
+        for n in novels:
+            card = NovelCard(
+                title=n['title'],
+                thumb_url=api.thumb_url(n['thumbnail_url']) or 'atlas://data/images/defaulttheme/image-missing',
+                novel_id=n['id'],
+                press_callback=self.open_novel,
+            )
+            self.ids.grid.add_widget(card)
+
+    def open_novel(self, novel_id):
+        app = App.get_running_app()
+        app.open_novel_detail(novel_id)
+
+    def do_search(self, text):
+        api.list_novels(self._loaded, lambda m: toast(m), q=text)
+
+
+Builder.load_string('''
+<HomeScreen>:
+    name: 'home'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: 'Novel Bridge'
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            right_action_items: [['account', lambda x: app.open_profile()]]
+        MDTextField:
+            id: search
+            hint_text: 'Search novels'
+            size_hint_y: None
+            height: dp(48)
+            padding: dp(10), dp(10)
+            on_text_validate: root.do_search(self.text)
+        MDScrollView:
+            MDGridLayout:
+                id: grid
+                cols: 3
+                spacing: dp(10)
+                padding: dp(10)
+                size_hint_y: None
+                height: self.minimum_height
+                adaptive_height: True
+''')
+
+
+# --------------------------------------------------------------------------- #
+# Novel Detail - styled after the reference screenshot:
+#   thumbnail + title/author/status header, action row, description,
+#   tag chips, "N chapters" heading, chapter list with dates, resume button.
+# --------------------------------------------------------------------------- #
+
+class ChapterRow(MDBoxLayout):
+    chapter_id = NumericProperty(0)
+    number_text = StringProperty('')
+    date_text = StringProperty('')
+    pending = BooleanProperty(False)
+    press_callback = ObjectProperty(None)
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and self.press_callback:
+            self.press_callback(self.chapter_id)
+            return True
+        return super().on_touch_down(touch)
+
+
+Builder.load_string('''
+<ChapterRow>:
+    size_hint_y: None
+    height: dp(56)
+    padding: dp(16), 0
+    canvas.before:
+        Color:
+            rgba: 0.42, 0.62, 1, 1
+        Ellipse:
+            pos: self.x, self.center_y - dp(3)
+            size: dp(6), dp(6)
+    MDBoxLayout:
+        orientation: 'vertical'
+        padding: dp(14), 0, 0, 0
+        MDLabel:
+            text: root.number_text + ('  [PENDING]' if root.pending else '')
+            bold: True
+            font_size: '15sp'
+            color: (0.95,0.7,0.3,1) if root.pending else (0.95, 0.95, 0.97, 1)
+        MDLabel:
+            text: root.date_text
+            font_size: '12sp'
+            theme_text_color: 'Secondary'
+    MDIconButton:
+        icon: 'book-open-page-variant-outline'
+        on_release: root.press_callback(root.chapter_id) if root.press_callback else None
+''')
+
+
+class NovelDetailScreen(MDScreen):
+    novel_id = NumericProperty(0)
+    novel_data = ObjectProperty(None)
+
+    def load(self, novel_id):
+        self.novel_id = novel_id
+        self.ids.chapter_list.clear_widgets()
+        self.ids.title_label.text = 'Loading...'
+        api.get_novel(novel_id, self._loaded, lambda m: toast(m))
+
+    def _loaded(self, data):
+        self.novel_data = data
+        self.ids.thumb.source = api.thumb_url(data['thumbnail_url']) or 'atlas://data/images/defaulttheme/image-missing'
+        self.ids.title_label.text = data['title']
+        self.ids.author_label.text = f"By {data['writer_username']}"
+        self.ids.status_badge.text = data['status'].upper()
+        self.ids.desc_label.text = data['description'] or '(no description yet)'
+        self.ids.chapter_count_label.text = f"{len(data['chapters'])} chapters"
+
+        self.ids.tag_row.clear_widgets()
+        for tag in data['tags']:
+            self.ids.tag_row.add_widget(Factory.TagChip(text=tag))
+
+        self.ids.chapter_list.clear_widgets()
+        chapters = sorted(data['chapters'], key=lambda c: c['chapter_number'], reverse=True)
+        for c in chapters:
+            row = ChapterRow(
+                chapter_id=c['id'],
+                number_text=f"Chapter {c['chapter_number']:g}" + (f" - {c['title']}" if c['title'] else ''),
+                date_text=c['created_at'][:10],
+                pending=(not c['approved']),
+                press_callback=self.open_chapter,
+            )
+            self.ids.chapter_list.add_widget(row)
+
+        app = App.get_running_app()
+        is_owner_writer = app.user and (
+            app.user['role'] in ('owner', 'admin') or
+            (app.user['role'] == 'writer' and app.user['id'] == data['writer_id'])
+        )
+        self.ids.writer_controls.clear_widgets()
+        if is_owner_writer:
+            toggle_to = 'completed' if data['status'] == 'ongoing' else 'ongoing'
+            self.ids.writer_controls.add_widget(MDFlatButton(
+                text=f'Mark as {toggle_to}',
+                on_release=lambda *_: self.set_status(toggle_to),
+            ))
+            self.ids.writer_controls.add_widget(MDFlatButton(
+                text='Add chapter',
+                on_release=lambda *_: App.get_running_app().open_upload_chapter(self.novel_id),
+            ))
+        self.ids.admin_controls.clear_widgets()
+        if app.user and app.user['role'] in ('owner', 'admin') and not data['approved']:
+            self.ids.admin_controls.add_widget(MDRaisedButton(
+                text='Approve novel', on_release=lambda *_: self.approve_novel()))
+            self.ids.admin_controls.add_widget(MDFlatButton(
+                text='Reject', on_release=lambda *_: self.reject_novel()))
+
+    def set_status(self, status):
+        api.update_novel(self.novel_id, {'status': status},
+                          lambda r: (toast('Status updated'), self.load(self.novel_id)),
+                          lambda m: toast(m))
+
+    def approve_novel(self):
+        api.approve_novel(self.novel_id, lambda r: (toast('Approved'), self.load(self.novel_id)),
+                           lambda m: toast(m))
+
+    def reject_novel(self):
+        api.reject_novel(self.novel_id, lambda r: (toast('Rejected'), self.load(self.novel_id)),
+                          lambda m: toast(m))
+
+    def open_chapter(self, chapter_id):
+        App.get_running_app().open_reader(chapter_id, self.novel_data)
+
+    def resume(self):
+        if self.novel_data and self.novel_data['chapters']:
+            approved = [c for c in self.novel_data['chapters'] if c['approved']]
+            if approved:
+                latest = sorted(approved, key=lambda c: c['chapter_number'])[0]
+                self.open_chapter(latest['id'])
+                return
+        toast('No readable chapters yet')
+
+    def go_back(self):
+        App.get_running_app().go_home()
+
+
+Builder.load_string('''
+<NovelDetailScreen>:
+    name: 'novel_detail'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: ''
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            left_action_items: [['arrow-left', lambda x: root.go_back()]]
+        MDScrollView:
+            MDBoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(16)
+                spacing: dp(12)
+                MDBoxLayout:
+                    size_hint_y: None
+                    height: dp(190)
+                    spacing: dp(14)
+                    AsyncImage:
+                        id: thumb
+                        size_hint_x: None
+                        width: dp(130)
+                        allow_stretch: True
+                        keep_ratio: False
+                    MDBoxLayout:
+                        orientation: 'vertical'
+                        spacing: dp(6)
+                        MDLabel:
+                            id: title_label
+                            text: ''
+                            font_style: 'H6'
+                            bold: True
+                            shorten: False
+                        MDLabel:
+                            id: author_label
+                            text: ''
+                            theme_text_color: 'Secondary'
+                            size_hint_y: None
+                            height: dp(22)
+                        StatusBadge:
+                            id: status_badge
+                            text: 'ONGOING'
+                        MDBoxLayout:
+                            id: writer_controls
+                            orientation: 'vertical'
+                            size_hint_y: None
+                            height: self.minimum_height
+                        MDBoxLayout:
+                            id: admin_controls
+                            spacing: dp(6)
+                            size_hint_y: None
+                            height: self.minimum_height
+                MDRaisedButton:
+                    text: 'Resume Reading'
+                    size_hint_x: 1
+                    on_release: root.resume()
+                MDLabel:
+                    id: desc_label
+                    text: ''
+                    theme_text_color: 'Secondary'
+                    size_hint_y: None
+                    height: self.texture_size[1]
+                    text_size: self.width, None
+                MDBoxLayout:
+                    id: tag_row
+                    spacing: dp(8)
+                    size_hint_y: None
+                    height: dp(34)
+                MDLabel:
+                    id: chapter_count_label
+                    text: '0 chapters'
+                    bold: True
+                    font_style: 'Subtitle1'
+                    size_hint_y: None
+                    height: dp(30)
+                MDList:
+                    id: chapter_list
+                    size_hint_y: None
+                    height: self.minimum_height
+''')
+
+
+# --------------------------------------------------------------------------- #
+# Reader - renders the raw .txt / .md chapter content
+# --------------------------------------------------------------------------- #
+
+class ReaderScreen(MDScreen):
+    novel_data = ObjectProperty(None)
+
+    def load(self, chapter_id, novel_data=None):
+        self.novel_data = novel_data
+        self.ids.body_label.text = 'Loading...'
+        api.get_chapter(chapter_id, self._loaded, lambda m: toast(m))
+
+    def _loaded(self, data):
+        chapter_title = data['title'] or f"Chapter {data['chapter_number']:g}"
+        self.ids.topbar.title = chapter_title
+        self.ids.body_label.text = markdown_to_kivy_markup(data['content'])
+        self._chapter = data
+
+    def go_back(self):
+        App.get_running_app().go_back_from_reader()
+
+
+Builder.load_string('''
+<ReaderScreen>:
+    name: 'reader'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            id: topbar
+            title: ''
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            left_action_items: [['arrow-left', lambda x: root.go_back()]]
+        MDScrollView:
+            MDLabel:
+                id: body_label
+                text: ''
+                markup: True
+                padding: dp(20), dp(20)
+                size_hint_y: None
+                height: self.texture_size[1] + dp(40)
+                text_size: self.width - dp(40), None
+                font_size: '16sp'
+                line_height: 1.4
+''')
+
+
+# --------------------------------------------------------------------------- #
+# Writer dashboard - create novel, upload chapters, view stats, toggle status
+# --------------------------------------------------------------------------- #
+
+class WriterScreen(MDScreen):
+    thumbnail_path = StringProperty('')
+
+    def on_pre_enter(self, *args):
+        self.refresh_stats()
+
+    def pick_thumbnail(self):
+        file_pick_popup('Pick a thumbnail image', ['*.png', '*.jpg', '*.jpeg', '*.webp'],
+                         self._thumb_chosen)
+
+    def _thumb_chosen(self, path):
+        self.thumbnail_path = path
+        self.ids.thumb_label.text = Path(path).name
+
+    def submit_novel(self):
+        title = self.ids.title_field.text.strip()
+        desc = self.ids.desc_field.text.strip()
+        tags = self.ids.tags_field.text.strip()
+        status = 'completed' if self.ids.status_switch.active else 'ongoing'
+        if not title:
+            toast('Title is required')
+            return
+        fields = {'title': title, 'description': desc, 'tags': tags, 'status': status}
+        api.create_novel(fields, self.thumbnail_path or None, self._novel_created, lambda m: toast(m))
+
+    def _novel_created(self, result):
+        toast('Novel submitted for admin approval')
+        self.ids.title_field.text = ''
+        self.ids.desc_field.text = ''
+        self.ids.tags_field.text = ''
+        self.thumbnail_path = ''
+        self.ids.thumb_label.text = 'No thumbnail chosen'
+        self.refresh_stats()
+
+    def refresh_stats(self):
+        self.ids.stats_list.clear_widgets()
+        api.writer_stats(self._stats_loaded, lambda m: toast(m))
+
+    def _stats_loaded(self, novels):
+        self.ids.stats_list.clear_widgets()
+        if not novels:
+            self.ids.stats_list.add_widget(MDLabel(text='You have not published any novels yet.'))
+            return
+        for n in novels:
+            approval = 'approved' if n['approved'] else ('rejected' if n['rejected'] else 'pending review')
+            box = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(96),
+                               padding=(dp(10), dp(6)))
+            box.md_bg_color = CARD_BG
+            box.add_widget(MDLabel(text=f"{n['title']}  ({approval})", bold=True))
+            box.add_widget(MDLabel(
+                text=(f"{n['chapter_count']} chapters "
+                      f"({n['approved_chapter_count']} approved, {n['pending_chapter_count']} pending)  |  "
+                      f"{n['views']} novel views  |  {n['total_chapter_views']} chapter views  |  "
+                      f"status: {n['status']}"),
+                theme_text_color='Secondary', font_size='12sp'))
+            row = MDBoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
+            row.add_widget(MDFlatButton(text='Open', on_release=lambda *_, nid=n['id']: App.get_running_app().open_novel_detail(nid)))
+            row.add_widget(MDFlatButton(text='Add chapter', on_release=lambda *_, nid=n['id']: App.get_running_app().open_upload_chapter(nid)))
+            box.add_widget(row)
+            self.ids.stats_list.add_widget(box)
+
+
+Builder.load_string('''
+<WriterScreen>:
+    name: 'writer'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: 'Write'
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+        MDScrollView:
+            MDBoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(16)
+                spacing: dp(10)
+                MDLabel:
+                    text: 'Submit a new novel'
+                    bold: True
+                    font_style: 'Subtitle1'
+                    size_hint_y: None
+                    height: dp(28)
+                MDTextField:
+                    id: title_field
+                    hint_text: 'Title'
+                MDTextField:
+                    id: desc_field
+                    hint_text: 'Description'
+                    multiline: True
+                MDTextField:
+                    id: tags_field
+                    hint_text: 'Tags, comma separated (Action, Fantasy, ...)'
+                MDBoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(10)
+                    MDFlatButton:
+                        text: 'Choose Thumbnail'
+                        on_release: root.pick_thumbnail()
+                    MDLabel:
+                        id: thumb_label
+                        text: 'No thumbnail chosen'
+                        theme_text_color: 'Secondary'
+                MDBoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    MDLabel:
+                        text: 'Mark completed'
+                    MDSwitch:
+                        id: status_switch
+                MDRaisedButton:
+                    text: 'Submit for Approval'
+                    size_hint_x: 1
+                    on_release: root.submit_novel()
+                MDLabel:
+                    text: 'Your novels & stats'
+                    bold: True
+                    font_style: 'Subtitle1'
+                    size_hint_y: None
+                    height: dp(36)
+                MDBoxLayout:
+                    id: stats_list
+                    orientation: 'vertical'
+                    spacing: dp(8)
+                    size_hint_y: None
+                    height: self.minimum_height
+''')
+
+
+class UploadChapterScreen(MDScreen):
+    novel_id = NumericProperty(0)
+    chapter_path = StringProperty('')
+
+    def open_for(self, novel_id):
+        self.novel_id = novel_id
+        self.chapter_path = ''
+        self.ids.file_label.text = 'No file chosen'
+        self.ids.number_field.text = ''
+        self.ids.title_field.text = ''
+
+    def pick_file(self):
+        file_pick_popup('Pick a .txt or .md chapter file', ['*.txt', '*.md'], self._file_chosen)
+
+    def _file_chosen(self, path):
+        self.chapter_path = path
+        self.ids.file_label.text = Path(path).name
+
+    def submit(self):
+        if not self.chapter_path:
+            toast('Choose a .txt or .md file first')
+            return
         try:
-            thumbnail_url = _upload_thumbnail(file)
-        except ValueError as e:
-            return jsonify(error=str(e)), 400
+            number = float(self.ids.number_field.text or '0')
+        except ValueError:
+            toast('Chapter number must be a number')
+            return
+        title = self.ids.title_field.text.strip()
+        api.upload_chapter(self.novel_id, number, title, self.chapter_path,
+                            self._uploaded, lambda m: toast(m))
 
-    result = sb.table('novels').insert({
-        'writer_id': g.user['id'],
-        'title': title,
-        'description': description,
-        'thumbnail_url': thumbnail_url,
-        'tags': tags,
-        'status': status,
-        'approved': False,
-        'rejected': False,
-        'views': 0,
-    }).execute()
-    _invalidate_novels_cache()
-    return jsonify(id=result.data[0]['id'], message='submitted for admin approval'), 201
+    def _uploaded(self, result):
+        toast('Chapter submitted for admin approval')
+        App.get_running_app().go_back_generic()
 
 
-@app.put('/api/novels/<int:novel_id>')
-@require_role('writer', 'admin', 'owner')
-def update_novel(novel_id):
-    existing = sb.table('novels').select('*').eq('id', novel_id).limit(1).execute()
-    if not existing.data:
-        return jsonify(error='not found'), 404
-    row = existing.data[0]
-    if g.user['role'] == 'writer' and row['writer_id'] != g.user['id']:
-        return jsonify(error='insufficient privileges'), 403
-
-    data = request.get_json(force=True, silent=True) or {}
-    updates = {}
-    for key in ('title', 'description', 'tags'):
-        if key in data:
-            updates[key] = data[key]
-    if 'status' in data:
-        if data['status'] not in ('ongoing', 'completed'):
-            return jsonify(error='status must be ongoing or completed'), 400
-        updates['status'] = data['status']
-    if not updates:
-        return jsonify(error='nothing to update'), 400
-    sb.table('novels').update(updates).eq('id', novel_id).execute()
-    _invalidate_novels_cache()
-    return jsonify(message='updated')
-
-
-@app.post('/api/novels/<int:novel_id>/thumbnail')
-@require_role('writer', 'admin', 'owner')
-def update_thumbnail(novel_id):
-    existing = sb.table('novels').select('*').eq('id', novel_id).limit(1).execute()
-    if not existing.data:
-        return jsonify(error='not found'), 404
-    row = existing.data[0]
-    if g.user['role'] == 'writer' and row['writer_id'] != g.user['id']:
-        return jsonify(error='insufficient privileges'), 403
-    file = request.files.get('thumbnail')
-    if not file or not file.filename:
-        return jsonify(error='thumbnail file required'), 400
-    try:
-        thumbnail_url = _upload_thumbnail(file)
-    except ValueError as e:
-        return jsonify(error=str(e)), 400
-    sb.table('novels').update({'thumbnail_url': thumbnail_url}).eq('id', novel_id).execute()
-    _invalidate_novels_cache()
-    return jsonify(message='thumbnail updated')
+Builder.load_string('''
+<UploadChapterScreen>:
+    name: 'upload_chapter'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: 'Add Chapter'
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            left_action_items: [['arrow-left', lambda x: app.go_back_generic()]]
+        MDBoxLayout:
+            orientation: 'vertical'
+            padding: dp(16)
+            spacing: dp(12)
+            MDTextField:
+                id: number_field
+                hint_text: 'Chapter number (e.g. 1 or 1.5)'
+                input_filter: 'float'
+            MDTextField:
+                id: title_field
+                hint_text: 'Chapter title (optional)'
+            MDBoxLayout:
+                size_hint_y: None
+                height: dp(40)
+                spacing: dp(10)
+                MDFlatButton:
+                    text: 'Choose .txt / .md File'
+                    on_release: root.pick_file()
+                MDLabel:
+                    id: file_label
+                    text: 'No file chosen'
+                    theme_text_color: 'Secondary'
+            MDRaisedButton:
+                text: 'Upload'
+                size_hint_x: 1
+                on_release: root.submit()
+''')
 
 
 # --------------------------------------------------------------------------- #
-# Chapters
+# Admin dashboard - approve/reject the pending queue
 # --------------------------------------------------------------------------- #
 
-@app.post('/api/novels/<int:novel_id>/chapters')
-@require_role('writer', 'admin', 'owner')
-def create_chapter(novel_id):
-    novel = sb.table('novels').select('*').eq('id', novel_id).limit(1).execute()
-    if not novel.data:
-        return jsonify(error='novel not found'), 404
-    novel_row = novel.data[0]
-    if g.user['role'] == 'writer' and novel_row['writer_id'] != g.user['id']:
-        return jsonify(error='insufficient privileges'), 403
+class AdminScreen(MDScreen):
+    def on_pre_enter(self, *args):
+        self.refresh()
 
-    file = request.files.get('file')
-    if not file or not file.filename:
-        return jsonify(error='.txt or .md file required'), 400
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_CHAPTER_EXT:
-        return jsonify(error=f'chapter file must be one of {ALLOWED_CHAPTER_EXT}'), 400
+    def refresh(self):
+        self.ids.queue.clear_widgets()
+        api.pending_queue(self._loaded, lambda m: toast(m))
 
-    try:
-        chapter_number = float(request.form.get('chapter_number', '0'))
-    except ValueError:
-        return jsonify(error='chapter_number must be a number'), 400
-    title = request.form.get('title') or f'Chapter {chapter_number:g}'
-    content = file.read().decode('utf-8', errors='replace')
+    def open_user_management(self):
+        App.get_running_app().open_user_management()
 
-    result = sb.table('chapters').insert({
-        'novel_id': novel_id,
-        'chapter_number': chapter_number,
-        'title': title,
-        'content': content,
-        'approved': False,
-        'rejected': False,
-        'views': 0,
-    }).execute()
-    return jsonify(id=result.data[0]['id'], message='chapter submitted for admin approval'), 201
+    def _loaded(self, data):
+        self.ids.queue.clear_widgets()
+        if not data['novels'] and not data['chapters']:
+            self.ids.queue.add_widget(MDLabel(text='Nothing pending review.'))
+            return
+        if data['novels']:
+            self.ids.queue.add_widget(MDLabel(text='Novels awaiting approval', bold=True,
+                                               size_hint_y=None, height=dp(30)))
+            for n in data['novels']:
+                self.ids.queue.add_widget(self._novel_row(n))
+        if data['chapters']:
+            self.ids.queue.add_widget(MDLabel(text='Chapters awaiting approval', bold=True,
+                                               size_hint_y=None, height=dp(30)))
+            for c in data['chapters']:
+                self.ids.queue.add_widget(self._chapter_row(c))
 
+    def _novel_row(self, n):
+        box = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(90),
+                           padding=(dp(10), dp(6)))
+        box.md_bg_color = CARD_BG
+        box.add_widget(MDLabel(text=n['title'], bold=True))
+        box.add_widget(MDLabel(text=n['description'][:80], theme_text_color='Secondary', font_size='12sp'))
+        row = MDBoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
+        row.add_widget(MDRaisedButton(text='Approve', on_release=lambda *_: self._approve_novel(n['id'])))
+        row.add_widget(MDFlatButton(text='Reject', on_release=lambda *_: self._reject_novel(n['id'])))
+        row.add_widget(MDFlatButton(text='View', on_release=lambda *_: App.get_running_app().open_novel_detail(n['id'])))
+        box.add_widget(row)
+        return box
 
-@app.get('/api/chapters/<int:chapter_id>')
-@optional_auth
-def get_chapter(chapter_id):
-    result = sb.table('chapters').select('*').eq('id', chapter_id).limit(1).execute()
-    if not result.data:
-        return jsonify(error='not found'), 404
-    row = result.data[0]
-    novel = sb.table('novels').select('*').eq('id', row['novel_id']).limit(1).execute().data[0]
-    allowed = row['approved'] and novel['approved']
-    if not allowed and not can_see_unapproved(g.user, novel):
-        return jsonify(error='not found'), 404
-    if allowed:
-        # Buffered instead of written straight away - see _flush_views_loop().
-        # The response below is optimistic (shows the view that was just
-        # made) even though the DB write itself happens a little later.
-        _queue_chapter_view(chapter_id)
-        row['views'] += 1
-    return jsonify(chapter_public(row, include_content=True))
+    def _chapter_row(self, c):
+        box = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(70),
+                           padding=(dp(10), dp(6)))
+        box.md_bg_color = CARD_BG
+        box.add_widget(MDLabel(text=f"{c['novel_title']} - Chapter {c['chapter_number']:g}", bold=True))
+        row = MDBoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
+        row.add_widget(MDRaisedButton(text='Approve', on_release=lambda *_: self._approve_chapter(c['id'])))
+        row.add_widget(MDFlatButton(text='Reject', on_release=lambda *_: self._reject_chapter(c['id'])))
+        box.add_widget(row)
+        return box
 
+    def _approve_novel(self, nid):
+        api.approve_novel(nid, lambda r: (toast('Approved'), self.refresh()), lambda m: toast(m))
 
-# --------------------------------------------------------------------------- #
-# Admin approval queue
-# --------------------------------------------------------------------------- #
+    def _reject_novel(self, nid):
+        api.reject_novel(nid, lambda r: (toast('Rejected'), self.refresh()), lambda m: toast(m))
 
-@app.get('/api/admin/pending')
-@require_role('admin', 'owner')
-def pending_queue():
-    novels = sb.table('novels').select('*').eq('approved', False).eq('rejected', False) \
-        .order('created_at').execute().data
-    chapters = sb.table('chapters').select('*').eq('approved', False).eq('rejected', False) \
-        .order('created_at').execute().data
+    def _approve_chapter(self, cid):
+        api.approve_chapter(cid, lambda r: (toast('Approved'), self.refresh()), lambda m: toast(m))
 
-    novel_titles = {}
-    if chapters:
-        novel_ids = list({c['novel_id'] for c in chapters})
-        rows = sb.table('novels').select('id, title').in_('id', novel_ids).execute().data
-        novel_titles = {r['id']: r['title'] for r in rows}
-
-    return jsonify(
-        novels=[novel_public(r) for r in novels],
-        chapters=[dict(chapter_public(c), novel_title=novel_titles.get(c['novel_id'], '?'))
-                  for c in chapters],
-    )
+    def _reject_chapter(self, cid):
+        api.reject_chapter(cid, lambda r: (toast('Rejected'), self.refresh()), lambda m: toast(m))
 
 
-@app.post('/api/admin/novels/<int:novel_id>/approve')
-@require_role('admin', 'owner')
-def approve_novel(novel_id):
-    sb.table('novels').update({'approved': True, 'rejected': False}).eq('id', novel_id).execute()
-    _invalidate_novels_cache()
-    return jsonify(message='novel approved')
-
-
-@app.post('/api/admin/novels/<int:novel_id>/reject')
-@require_role('admin', 'owner')
-def reject_novel(novel_id):
-    sb.table('novels').update({'approved': False, 'rejected': True}).eq('id', novel_id).execute()
-    _invalidate_novels_cache()
-    return jsonify(message='novel rejected')
-
-
-@app.post('/api/admin/chapters/<int:chapter_id>/approve')
-@require_role('admin', 'owner')
-def approve_chapter(chapter_id):
-    sb.table('chapters').update({'approved': True, 'rejected': False}).eq('id', chapter_id).execute()
-    return jsonify(message='chapter approved')
-
-
-@app.post('/api/admin/chapters/<int:chapter_id>/reject')
-@require_role('admin', 'owner')
-def reject_chapter(chapter_id):
-    sb.table('chapters').update({'approved': False, 'rejected': True}).eq('id', chapter_id).execute()
-    return jsonify(message='chapter rejected')
+Builder.load_string('''
+<AdminScreen>:
+    name: 'admin'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: 'Admin Review Queue'
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            right_action_items: [['account-supervisor', lambda x: root.open_user_management()]]
+        MDScrollView:
+            MDBoxLayout:
+                id: queue
+                orientation: 'vertical'
+                spacing: dp(8)
+                padding: dp(10)
+                size_hint_y: None
+                height: self.minimum_height
+''')
 
 
 # --------------------------------------------------------------------------- #
-# Writer stats
+# User management (role changes) - owner promotes/demotes here, no more
+# needing Postman/curl for POST /api/users/<id>/role.
 # --------------------------------------------------------------------------- #
 
-@app.get('/api/writer/stats')
-@require_role('writer', 'admin', 'owner')
-def writer_stats():
-    novels = sb.table('novels').select('*').eq('writer_id', g.user['id']) \
-        .order('created_at', desc=True).execute().data
-    if not novels:
-        return jsonify([])
+class UserManagementScreen(MDScreen):
+    def on_pre_enter(self, *args):
+        self.refresh()
 
-    # One query for ALL chapters across every novel this writer has,
-    # instead of one query per novel (that was the N+1 here before).
-    novel_ids = [n['id'] for n in novels]
-    all_chapters = sb.table('chapters').select('novel_id, approved, rejected, views') \
-        .in_('novel_id', novel_ids).execute().data
+    def refresh(self):
+        self.ids.user_list.clear_widgets()
+        api.list_users(self._loaded, lambda m: toast(m))
 
-    chapters_by_novel = defaultdict(list)
-    for c in all_chapters:
-        chapters_by_novel[c['novel_id']].append(c)
+    def _loaded(self, users):
+        self.ids.user_list.clear_widgets()
+        app = App.get_running_app()
+        is_owner = app.user and app.user['role'] == 'owner'
+        for u in users:
+            box = MDBoxLayout(orientation='vertical', size_hint_y=None, height=dp(92),
+                               padding=(dp(10), dp(6)))
+            box.md_bg_color = CARD_BG
+            box.add_widget(MDLabel(text=f"{u['username']}", bold=True))
+            box.add_widget(MDLabel(text=f"role: {u['role']}", theme_text_color='Secondary', font_size='12sp'))
+            if is_owner and u['role'] != 'owner':
+                row = MDBoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+                for role in ('user', 'writer', 'admin'):
+                    if role == u['role']:
+                        continue
+                    row.add_widget(MDFlatButton(
+                        text=f'Make {role}',
+                        on_release=lambda *_, uid=u['id'], r=role: self._change_role(uid, r),
+                    ))
+                box.add_widget(row)
+            self.ids.user_list.add_widget(box)
 
-    out = []
-    for n in novels:
-        chapters = chapters_by_novel.get(n['id'], [])
-        out.append({
-            **novel_public(n),
-            'chapter_count': len(chapters),
-            'approved_chapter_count': sum(1 for c in chapters if c['approved']),
-            'pending_chapter_count': sum(1 for c in chapters if not c['approved'] and not c['rejected']),
-            'total_chapter_views': sum(c['views'] for c in chapters),
-        })
-    return jsonify(out)
+    def _change_role(self, user_id, role):
+        api.set_role(user_id, role, lambda r: (toast(f'Role updated to {role}'), self.refresh()),
+                     lambda m: toast(m))
 
 
-@app.get('/api/health')
-def health():
-    return jsonify(status='ok', time=now_iso())
+Builder.load_string('''
+<UserManagementScreen>:
+    name: 'user_management'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: 'Manage Users'
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            left_action_items: [['arrow-left', lambda x: app.open_admin()]]
+        MDScrollView:
+            MDBoxLayout:
+                id: user_list
+                orientation: 'vertical'
+                spacing: dp(8)
+                padding: dp(10)
+                size_hint_y: None
+                height: self.minimum_height
+''')
+
+
+# --------------------------------------------------------------------------- #
+# Profile
+# --------------------------------------------------------------------------- #
+
+class ProfileScreen(MDScreen):
+    def on_pre_enter(self, *args):
+        app = App.get_running_app()
+        if app.user:
+            self.ids.info_label.text = f"{app.user['username']}  ({app.user['role']})"
+        else:
+            self.ids.info_label.text = 'Browsing as guest'
+
+    def change_password(self):
+        old = self.ids.old_password.text
+        new = self.ids.new_password.text
+        if not old or not new:
+            toast('Fill in both password fields')
+            return
+        api.change_password(old, new, self._changed, lambda m: toast(m))
+
+    def _changed(self, result):
+        toast('Password changed')
+        self.ids.old_password.text = ''
+        self.ids.new_password.text = ''
+
+    def logout(self):
+        api.token = None
+        App.get_running_app().user = None
+        App.get_running_app().show_login()
+
+
+Builder.load_string('''
+<ProfileScreen>:
+    name: 'profile'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        MDTopAppBar:
+            title: 'Profile'
+            elevation: 0
+            md_bg_color: 0.10, 0.10, 0.13, 1
+            left_action_items: [['arrow-left', lambda x: app.go_home()]]
+        MDBoxLayout:
+            orientation: 'vertical'
+            padding: dp(20)
+            spacing: dp(14)
+            MDLabel:
+                id: info_label
+                text: ''
+                font_style: 'H6'
+                halign: 'center'
+                size_hint_y: None
+                height: dp(40)
+            MDRaisedButton:
+                text: 'Log Out / Switch Account'
+                pos_hint: {'center_x': 0.5}
+                on_release: root.logout()
+            Widget:
+                size_hint_y: None
+                height: dp(10)
+            MDLabel:
+                text: 'Change password'
+                bold: True
+                size_hint_y: None
+                height: dp(28)
+            MDTextField:
+                id: old_password
+                hint_text: 'Current password'
+                password: True
+            MDTextField:
+                id: new_password
+                hint_text: 'New password'
+                password: True
+            MDRaisedButton:
+                text: 'Update Password'
+                pos_hint: {'center_x': 0.5}
+                on_release: root.change_password()
+            Widget:
+''')
+
+
+# --------------------------------------------------------------------------- #
+# Bottom navigation bar (kept simple/manual for cross-version robustness)
+# --------------------------------------------------------------------------- #
+
+class RootScreen(MDScreen):
+    """Holds the ScreenManager plus a bottom nav bar that adapts to role."""
+    pass
+
+
+Builder.load_string('''
+<RootScreen>:
+    name: 'root'
+    MDBoxLayout:
+        orientation: 'vertical'
+        md_bg_color: 0.06, 0.06, 0.08, 1
+        ScreenManager:
+            id: sm
+        MDBoxLayout:
+            id: bottom_nav
+            size_hint_y: None
+            height: dp(56)
+            md_bg_color: 0.10, 0.10, 0.13, 1
+''')
+
+
+# --------------------------------------------------------------------------- #
+# App
+# --------------------------------------------------------------------------- #
+
+class NovelBridgeApp(MDApp):
+    user = ObjectProperty(None, allownone=True)
+
+    def build(self):
+        self.title = 'Novel Bridge'
+        self.theme_cls.theme_style = 'Dark'
+        self.theme_cls.primary_palette = 'Blue'
+        Window.minimum_width, Window.minimum_height = (400, 640)
+        Clock.max_iteration = 40  # headroom in case any layout needs a few extra passes
+
+        self.root_screen = RootScreen()
+        self.sm = self.root_screen.ids.sm
+        self.sm.transition = SlideTransition(duration=0.16)
+
+        self.login_screen = LoginScreen()
+        self.home_screen = HomeScreen()
+        self.novel_detail_screen = NovelDetailScreen()
+        self.reader_screen = ReaderScreen()
+        self.writer_screen = WriterScreen()
+        self.upload_chapter_screen = UploadChapterScreen()
+        self.admin_screen = AdminScreen()
+        self.user_management_screen = UserManagementScreen()
+        self.profile_screen = ProfileScreen()
+
+        for s in (self.login_screen, self.home_screen, self.novel_detail_screen,
+                  self.reader_screen, self.writer_screen, self.upload_chapter_screen,
+                  self.admin_screen, self.user_management_screen, self.profile_screen):
+            self.sm.add_widget(s)
+
+        self._history = []  # simple back-stack for generic screens
+        self.sm.current = 'login'
+        return self.root_screen
+
+    # -- navigation helpers --------------------------------------------------
+    def on_authenticated(self):
+        self._build_bottom_nav()
+        self.go_home()
+
+    def _build_bottom_nav(self):
+        bar = self.root_screen.ids.bottom_nav
+        bar.clear_widgets()
+
+        items = [('home', self.go_home)]
+        if self.user and self.user['role'] in ('writer', 'admin', 'owner'):
+            items.append(('pencil', self.open_writer))
+        if self.user and self.user['role'] in ('admin', 'owner'):
+            items.append(('shield-check', self.open_admin))
+        items.append(('account', self.open_profile))
+
+        # size_hint=(1, 1) on every button makes the MDBoxLayout (horizontal)
+        # split its full width evenly between them, instead of each button
+        # taking only its natural (small) size and leaving the rest of the
+        # bar empty on the right.
+        for icon, callback in items:
+            bar.add_widget(MDIconButton(
+                icon=icon,
+                size_hint=(1, 1),
+                pos_hint={'center_y': 0.5},
+                on_release=lambda *_, cb=callback: cb(),
+            ))
+
+    def show_login(self):
+        self.root_screen.ids.bottom_nav.clear_widgets()
+        self.sm.current = 'login'
+
+    def go_home(self):
+        self.sm.transition.direction = 'right'
+        # Just switch screens - HomeScreen.on_pre_enter() already calls
+        # refresh() whenever it becomes the current screen, so calling it
+        # here too fired GET /api/novels twice on every navigation to home.
+        self.sm.current = 'home'
+
+    def open_novel_detail(self, novel_id):
+        self.sm.transition.direction = 'left'
+        self.novel_detail_screen.load(novel_id)
+        self.sm.current = 'novel_detail'
+
+    def open_reader(self, chapter_id, novel_data=None):
+        self.sm.transition.direction = 'left'
+        self.reader_screen.load(chapter_id, novel_data)
+        self.sm.current = 'reader'
+
+    def go_back_from_reader(self):
+        self.sm.transition.direction = 'right'
+        if self.reader_screen.novel_data:
+            self.novel_detail_screen.load(self.reader_screen.novel_data['id'])
+            self.sm.current = 'novel_detail'
+        else:
+            self.go_home()
+
+    def open_writer(self):
+        self.sm.transition.direction = 'left'
+        self.sm.current = 'writer'
+
+    def open_upload_chapter(self, novel_id):
+        self.sm.transition.direction = 'left'
+        self.upload_chapter_screen.open_for(novel_id)
+        self.sm.current = 'upload_chapter'
+
+    def go_back_generic(self):
+        self.sm.transition.direction = 'right'
+        self.sm.current = 'writer' if self.user and self.user['role'] in ('writer', 'admin', 'owner') else 'home'
+        self.writer_screen.refresh_stats()
+
+    def open_admin(self):
+        self.sm.transition.direction = 'left'
+        self.sm.current = 'admin'
+
+    def open_user_management(self):
+        self.sm.transition.direction = 'left'
+        self.sm.current = 'user_management'
+
+    def open_profile(self):
+        self.sm.transition.direction = 'left'
+        self.sm.current = 'profile'
 
 
 if __name__ == '__main__':
-    init_owner()
-    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'
-    # threaded=True so two near-simultaneous requests (e.g. the client
-    # firing two GET /api/novels back to back) don't queue behind each
-    # other on a single worker thread - which was making the stale-socket
-    # issue above much easier to trigger.
-    app.run(host='0.0.0.0', port=8000, debug=debug_mode, threaded=True)
+    NovelBridgeApp().run()

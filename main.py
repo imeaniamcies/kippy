@@ -38,6 +38,7 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
 from kivy.metrics import dp
+from kivy.utils import platform
 from kivy.graphics import Color, RoundedRectangle
 from kivy.properties import (
     BooleanProperty, ListProperty, NumericProperty, ObjectProperty, StringProperty
@@ -61,7 +62,19 @@ from kivymd.uix.gridlayout import MDGridLayout
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.menu import MDDropdownMenu
 
-SERVER_URL = os.environ.get('NOVEL_BRIDGE_SERVER', 'http://127.0.0.1:8000')
+# Load API_URL from a bundled .env (python-dotenv is optional; falls back to
+# environment variables / the localhost default if it isn't installed).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+except ImportError:
+    pass
+
+SERVER_URL = (
+    os.environ.get('API_URL')
+    or os.environ.get('NOVEL_BRIDGE_SERVER')
+    or 'http://127.0.0.1:8000'
+).rstrip('/')
 
 BG = (0.06, 0.06, 0.08, 1)
 CARD_BG = (0.13, 0.13, 0.17, 1)
@@ -92,7 +105,7 @@ class Api:
     def _request(self, method, path, **kwargs):
         url = f'{SERVER_URL}{path}'
         try:
-            resp = requests.request(method, url, headers=self._headers(), timeout=15, **kwargs)
+            resp = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
         except requests.exceptions.RequestException as e:
             raise ApiError(f'Could not reach server: {e}')
         try:
@@ -245,7 +258,7 @@ def toast(text, duration=2.2):
 def file_pick_popup(title, filters, on_choice):
     """Small filechooser popup; returns the chosen path via on_choice(path)."""
     layout = MDBoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
-    chooser = FileChooserListView(filters=filters, path=str(Path.home()))
+    chooser = FileChooserListView(filters=filters, path=('/storage/emulated/0' if platform == 'android' else str(Path.home())))
     layout.add_widget(chooser)
     btn_row = MDBoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
     popup = Popup(title=title, content=layout, size_hint=(0.9, 0.9))
