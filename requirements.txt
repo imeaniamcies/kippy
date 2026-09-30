@@ -4,3 +4,4 @@ supabase>=2.10
 httpx
 python-dotenv
 flask-limiter>=3.5
+gunicorn
